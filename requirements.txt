@@ -1,11 +1,11 @@
 chex
 click
 fire
-jax
-jaxlib 
+jax[cuda]==0.4.34
+jaxlib
 mctx
 opax
-optax
+optax #==0.2.2
 pax3
 tqdm
 # tensorflow-cpu
