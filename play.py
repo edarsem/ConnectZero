@@ -186,8 +186,8 @@ def human_vs_agent(
 
 
 def main(
-    game_class: str = "games.connect_two_game.Connect2Game",
-    agent_class="policies.mlp_policy.MlpPolicyValueNet",
+    game_class: str = "games.connect_four_game.Connect4Game",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
     ckpt_filename: str = "./agent.ckpt",
     human_first: bool = False,
     disable_mcts: bool = False,
