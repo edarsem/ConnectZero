@@ -1,13 +1,13 @@
-chex
-click
-fire
+chex==0.1.88
+click==8.1.7
+fire==0.7.0
 jax[cuda]==0.4.34
 jaxlib
-mctx
-opax
-optax #==0.2.2
-pax3
+mctx==0.0.5
+opax==0.2.11
+optax==0.2.4
+pax3==0.5.9
 tqdm
 # tensorflow-cpu
 # pygraphviz
-flask
+flask==3.1.0
