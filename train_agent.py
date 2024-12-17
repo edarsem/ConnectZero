@@ -206,11 +206,12 @@ def train_step(net, optim, data: TrainingExample):
 
 
 def train(
-    game_class="games.connect_two_game.Connect2Game",
-    agent_class="policies.mlp_policy.MlpPolicyValueNet",
+    game_class="games.connect_four_game.Connect4Game",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
     selfplay_batch_size: int = 128,
     training_batch_size: int = 128,
-    num_iterations: int = 100,
+    num_iterations: int = 3,
+    # num_iterations: int = 100,
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 0.01,
