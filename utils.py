@@ -80,3 +80,10 @@ def load_model(load_path: str, iteration: int):
         model = pickle.load(f)
     print(f"Model loaded from {model_file}")
     return model
+
+
+def make_directories(base_path, variant):
+    """Prepare the directory structure for storing models."""
+    path = os.path.join(base_path, variant)
+    os.makedirs(path, exist_ok=True)
+    return path
