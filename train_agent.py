@@ -1,5 +1,6 @@
 import os
 import pickle
+import csv
 import random
 from functools import partial
 from typing import Optional, List, Tuple, Callable
@@ -446,6 +447,14 @@ def train_agent_generic(
     agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
     agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
 
+    # Prepare log file
+    log_filename = os.path.join(output_dir, "training_log.csv")
+    log_exists = os.path.isfile(log_filename)
+    with open(log_filename, "a", newline="") as log_file:
+        writer = csv.writer(log_file)
+        if not log_exists:
+            writer.writerow(["iteration", "value_loss", "policy_loss", "wins", "draws", "losses"])
+
     # Caches for loading frozen/other agents only once
     frozen_agent_cache = {}
     other_agent_cache = {}
@@ -479,6 +488,11 @@ def train_agent_generic(
         wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
         print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
         print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
+
+        # Append results to log
+        with open(log_filename, "a", newline="") as log_file:
+            writer = csv.writer(log_file)
+            writer.writerow([iteration, value_loss, policy_loss, wins, draws, losses])
 
         save_training_state(agent, optim, iteration, ckpt_filename)
 
