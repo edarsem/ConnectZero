@@ -3,6 +3,8 @@
 import importlib
 from functools import partial
 from typing import Tuple, TypeVar
+import pickle
+import os
 
 import chex
 import jax
@@ -60,3 +62,36 @@ def select_tree(pred: jnp.ndarray, a, b):
     """Selects a pytree based on the given predicate."""
     assert pred.ndim == 0 and pred.dtype == jnp.bool_, "expected boolean scalar"
     return jax.tree_util.tree_map(partial(jax.lax.select, pred), a, b)
+
+
+def save_model(agent, save_path: str, iteration: int):
+    """Save only the agent's state dict."""
+    os.makedirs(save_path, exist_ok=True)
+    model_file = os.path.join(save_path, f"model_iteration_{iteration}.pkl")
+    with open(model_file, "wb") as f:
+        state_dict = jax.device_get(agent.state_dict())
+        pickle.dump(state_dict, f)
+    print(f"Model saved at {model_file}")
+
+
+def load_model(game_class: str, agent_class: str, load_path: str, iteration: int):
+    """Load a model from disk by loading state dict into a freshly instantiated agent."""
+    model_file = os.path.join(load_path, f"model_iteration_{iteration}.pkl")
+    with open(model_file, "rb") as f:
+        state_dict = pickle.load(f)
+    
+    env = import_class(game_class)()
+    agent = import_class(agent_class)(
+        input_dims=env.observation().shape,
+        num_actions=env.num_actions()
+    )
+    agent = agent.load_state_dict(state_dict)
+    print(f"Model loaded from {model_file}")
+    return agent
+
+
+def make_directories(base_path, variant):
+    """Prepare the directory structure for storing models."""
+    path = os.path.join(base_path, variant)
+    os.makedirs(path, exist_ok=True)
+    return path
