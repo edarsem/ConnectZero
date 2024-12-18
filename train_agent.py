@@ -446,6 +446,9 @@ def train_agent_generic(
     if aux_dir:
         os.makedirs(aux_dir, exist_ok=True)
 
+    models_dir = os.path.join(output_dir, "models_by_iteration")
+    os.makedirs(models_dir, exist_ok=True)
+
     env = import_class(game_class)()
     devices = jax.local_devices()
     rng_key = jax.random.PRNGKey(random_seed)
@@ -499,11 +502,11 @@ def train_agent_generic(
             writer = csv.writer(log_file)
             writer.writerow([iteration, value_loss, policy_loss, wins, draws, losses])
 
-        save_training_state(agent, optim, iteration, ckpt_filename)
+        # Save the current agent with its iteration
+        save_model(agent, models_dir, iteration)
 
-        # If we want to save models each iteration for vs_all scenario
-        if data_generation_fn == generate_self_play_data_vs_all:
-            save_model(agent, aux_dir, iteration)
+        # Save checkpoint
+        save_training_state(agent, optim, iteration, ckpt_filename)
 
     print("Done!")
 
