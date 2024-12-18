@@ -1,15 +1,8 @@
-"""
-AlphaZero training script.
-
-Contains utilities and subfunctions for training, as well as the
-train_normal and train_frozen functions.
-"""
-
 import os
 import pickle
 import random
 from functools import partial
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Callable
 
 import chex
 import click
@@ -31,13 +24,6 @@ EPSILON = 1e-9  # a very small positive value
 
 @chex.dataclass(frozen=True)
 class TrainingExample:
-    """AlphaZero training example.
-
-    state: the current state of the game.
-    action_weights: the target action probabilities from MCTS policy.
-    value: the target value from self-play result.
-    """
-
     state: chex.Array
     action_weights: chex.Array
     value: chex.Array
@@ -45,14 +31,6 @@ class TrainingExample:
 
 @chex.dataclass(frozen=True)
 class MoveOutput:
-    """The output of a single self-play move.
-
-    state: the current state of game.
-    reward: the reward after executing the action.
-    terminated: whether the current state is terminated.
-    action_weights: the action probabilities from MCTS policy.
-    """
-
     state: chex.Array
     reward: chex.Array
     terminated: chex.Array
@@ -67,20 +45,12 @@ def collect_batched_self_play_data(
     batch_size: int,
     num_simulations_per_move: int,
 ):
-    """Collect a batch of self-play data using mcts."""
-
     def single_move(prev, _):
         env, rng_key, step = prev
         rng_key, rng_key_next = jax.random.split(rng_key, 2)
         state = jax.vmap(lambda e: e.canonical_observation())(env)
         terminated = env.is_terminated()
-        policy_output = improve_policy_with_mcts(
-            agent,
-            env,
-            rng_key,
-            recurrent_fn,
-            num_simulations_per_move,
-        )
+        policy_output = improve_policy_with_mcts(agent, env, rng_key, recurrent_fn, num_simulations_per_move)
         env, reward = jax.vmap(env_step)(env, policy_output.action)
         return (env, rng_key_next, step + 1), MoveOutput(
             state=state,
@@ -93,17 +63,12 @@ def collect_batched_self_play_data(
     env = replicate(env, batch_size)
     step = jnp.array(1)
     _, self_play_data = pax.scan(
-        single_move,
-        (env, rng_key, step),
-        None,
-        length=env.max_num_steps(),
-        time_major=False,
+        single_move, (env, rng_key, step), None, length=env.max_num_steps(), time_major=False
     )
     return self_play_data
 
 
 def prepare_training_data(data: MoveOutput, env: Enviroment) -> List[TrainingExample]:
-    """Preprocess the data collected from self-play."""
     buffer = []
     num_games = len(data.terminated)
     for i in range(num_games):
@@ -141,7 +106,6 @@ def collect_self_play_data(
     data_size: int,
     num_simulations_per_move: int,
 ) -> List[TrainingExample]:
-    """Collect self-play data for training."""
     num_iters = data_size // batch_size
     devices = jax.local_devices()
     num_devices = len(devices)
@@ -152,35 +116,22 @@ def collect_self_play_data(
     with click.progressbar(range(num_iters), label="  self play     ") as bar:
         for i in bar:
             batch = collect_batched_self_play_data(
-                agent,
-                env,
-                rng_keys[i],
-                batch_size // num_devices,
-                num_simulations_per_move,
+                agent, env, rng_keys[i], batch_size // num_devices, num_simulations_per_move
             )
             batch = jax.device_get(batch)
-            batch = jax.tree_util.tree_map(
-                lambda x: x.reshape((-1, *x.shape[2:])), batch
-            )
+            batch = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[2:])), batch)
             data.extend(prepare_training_data(batch, env=env))
     return data
 
 
 def loss_fn(net, data: TrainingExample):
-    """Sum of value loss and policy loss."""
     net, (action_logits, value) = batched_policy(net, data.state)
+    mse_loss = jnp.mean(optax.l2_loss(value, data.value))
 
-    # value loss (mse)
-    mse_loss = optax.l2_loss(value, data.value)
-    mse_loss = jnp.mean(mse_loss)
-
-    # policy loss (KL)
-    target_pr = data.action_weights
-    target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
+    target_pr = jnp.where(data.action_weights == 0, EPSILON, data.action_weights)
     action_logits = jax.nn.log_softmax(action_logits, axis=-1)
     kl_loss = jnp.sum(target_pr * (jnp.log(target_pr) - action_logits), axis=-1)
     kl_loss = jnp.mean(kl_loss)
-
     return mse_loss + kl_loss, (net, (mse_loss, kl_loss))
 
 
@@ -199,27 +150,20 @@ def initialize_agent_and_optim(
     learning_rate: float,
     lr_decay_steps: int,
 ) -> Tuple[pax.Module, opax.optimizer]:
-    """Initialize the agent and optimizer."""
     env = import_class(game_class)()
     agent = import_class(agent_class)(
-        input_dims=env.observation().shape,
-        num_actions=env.num_actions(),
+        input_dims=env.observation().shape, num_actions=env.num_actions()
     )
 
     def lr_schedule(step):
         e = jnp.floor(step * 1.0 / lr_decay_steps)
         return learning_rate * jnp.exp2(-e)
 
-    optim = opax.chain(
-        opax.add_decayed_weights(weight_decay),
-        opax.sgd(lr_schedule, momentum=0.9),
-    ).init(agent.parameters())
-
+    optim = opax.chain(opax.add_decayed_weights(weight_decay), opax.sgd(lr_schedule, momentum=0.9)).init(agent.parameters())
     return agent, optim
 
 
 def load_checkpoint_if_exists(agent, optim, ckpt_filename: str):
-    """Load the agent and optimizer states from a checkpoint if it exists."""
     if os.path.isfile(ckpt_filename):
         print("Loading weights at", ckpt_filename)
         with open(ckpt_filename, "rb") as f:
@@ -239,11 +183,8 @@ def train_one_epoch(
     training_batch_size: int,
     devices,
 ) -> Tuple[pax.Module, opax.optimizer, float, float]:
-    """Train the agent for one epoch on the provided data."""
     num_devices = len(devices)
     shuffler = random.Random(42)
-
-    # Shuffle data before training
     shuffler.shuffle(data)
 
     def _stack_and_reshape(*xs):
@@ -277,7 +218,6 @@ def evaluate_agents_after_training(
     num_eval_games: int,
     num_simulations_per_move: int,
 ):
-    """Evaluate the new agent against the old agent."""
     result_1: PlayResults = agent_vs_agent_multiple_games(
         agent.eval(),
         old_agent,
@@ -301,7 +241,6 @@ def evaluate_agents_after_training(
 
 
 def save_training_state(agent, optim, iteration: int, filename: str):
-    """Save the current training state to disk."""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as writer:
         dic = {
@@ -312,6 +251,248 @@ def save_training_state(agent, optim, iteration: int, filename: str):
         pickle.dump(dic, writer)
 
 
+#############################################
+# DATA GENERATION FUNCTIONS
+#############################################
+
+def generate_self_play_data_normal(
+    iteration: int,
+    agent: pax.Module,
+    env: Enviroment,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    **kwargs
+) -> List[TrainingExample]:
+    # Just generate data from the current agent
+    return collect_self_play_data(
+        agent.eval(),
+        env,
+        rng_key,
+        selfplay_batch_size,
+        num_self_plays_per_iteration,
+        num_simulations_per_move,
+    )
+
+
+def generate_self_play_data_frozen(
+    iteration: int,
+    agent: pax.Module,
+    env: Enviroment,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    freeze_iteration: int,
+    aux_dir: str,
+    game_class: str,
+    agent_class: str,
+    frozen_agent_cache: dict,
+    **kwargs
+) -> List[TrainingExample]:
+    # If not frozen yet, just use the current agent
+    if iteration < freeze_iteration:
+        opponent_agent = agent.eval()
+    else:
+        if iteration == freeze_iteration:
+            print(f"Freezing agent at iteration {freeze_iteration}")
+            save_model(agent, aux_dir, freeze_iteration)
+            frozen_agent = load_model(game_class, agent_class, aux_dir, freeze_iteration)
+            frozen_agent = frozen_agent.eval()
+        
+        # Load frozen agent if not in cache
+        if 'frozen_agent' not in frozen_agent_cache:
+            frozen_agent = load_model(game_class, agent_class, aux_dir, freeze_iteration)
+            frozen_agent = frozen_agent.eval()
+            frozen_agent_cache['frozen_agent'] = frozen_agent
+        opponent_agent = frozen_agent_cache['frozen_agent']
+
+    return collect_self_play_data(
+        opponent_agent,
+        env,
+        rng_key,
+        selfplay_batch_size,
+        num_self_plays_per_iteration,
+        num_simulations_per_move,
+    )
+
+
+def generate_self_play_data_vs_all(
+    iteration: int,
+    agent: pax.Module,
+    env: Enviroment,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    aux_dir: str,
+    game_class: str,
+    agent_class: str,
+    **kwargs
+) -> List[TrainingExample]:
+    rng_key_1, rng_key = jax.random.split(rng_key)
+
+    if iteration == 0:
+        return collect_self_play_data(
+            agent.eval(),
+            env,
+            rng_key_1,
+            selfplay_batch_size,
+            num_self_plays_per_iteration,
+            num_simulations_per_move,
+        )
+    else:
+        # Generate equal fraction of data from each previous agent plus current agent
+        data = []
+        agents_count = iteration
+        data_per_agent = num_self_plays_per_iteration // (agents_count + 1)
+        batch_size_per_agent = selfplay_batch_size // (agents_count + 1)
+
+        rng_keys_for_agents = jax.random.split(rng_key_1, agents_count)
+        for prev_iter in range(iteration):
+            prev_agent = load_model(game_class, agent_class, aux_dir, prev_iter)
+            prev_agent = prev_agent.eval()
+            data_prev = collect_self_play_data(
+                prev_agent,
+                env,
+                rng_keys_for_agents[prev_iter],
+                batch_size_per_agent,
+                data_per_agent,
+                num_simulations_per_move,
+            )
+            data.extend(data_prev)
+
+        # Current agent data
+        rng_key_data, _ = jax.random.split(rng_key)
+        data_current = collect_self_play_data(
+            agent.eval(),
+            env,
+            rng_key_data,
+            batch_size_per_agent,
+            data_per_agent,
+            num_simulations_per_move,
+        )
+        data.extend(data_current)
+        return data
+
+
+def generate_self_play_data_vs_other(
+    iteration: int,
+    agent: pax.Module,
+    env: Enviroment,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    other_agent_ckpt: str,
+    game_class: str,
+    agent_class: str,
+    other_agent_cache: dict,
+    **kwargs
+) -> List[TrainingExample]:
+    # Load other_agent only once and store in cache
+    if 'other_agent' not in other_agent_cache:
+        if not os.path.isfile(other_agent_ckpt):
+            raise FileNotFoundError(f"Other checkpoint not found: {other_agent_ckpt}")
+        env_tmp = import_class(game_class)()
+        other_agent = import_class(agent_class)(
+            input_dims=env_tmp.observation().shape,
+            num_actions=env_tmp.num_actions()
+        )
+        with open(other_agent_ckpt, "rb") as f:
+            dic = pickle.load(f)
+            other_agent = other_agent.load_state_dict(dic["agent"])
+        other_agent = other_agent.eval()
+        other_agent_cache['other_agent'] = other_agent
+    other_agent = other_agent_cache['other_agent']
+
+    return collect_self_play_data(
+        other_agent,
+        env,
+        rng_key,
+        selfplay_batch_size,
+        num_self_plays_per_iteration,
+        num_simulations_per_move,
+    )
+
+
+#############################################
+# GENERIC TRAIN FUNCTION
+#############################################
+
+def train_agent_generic(
+    game_class: str,
+    agent_class: str,
+    selfplay_batch_size: int,
+    training_batch_size: int,
+    num_iterations: int,
+    num_simulations_per_move: int,
+    num_self_plays_per_iteration: int,
+    learning_rate: float,
+    ckpt_filename: str,
+    random_seed: int,
+    weight_decay: float,
+    lr_decay_steps: int,
+    num_eval_games: int,
+    data_generation_fn: Callable,
+    output_dir: str,
+    aux_dir: str = "",
+    **kwargs
+):
+    env = import_class(game_class)()
+    devices = jax.local_devices()
+    rng_key = jax.random.PRNGKey(random_seed)
+    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
+    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
+
+    # Caches for loading frozen/other agents only once
+    frozen_agent_cache = {}
+    other_agent_cache = {}
+
+    for iteration in range(start_iter, num_iterations):
+        print(f"Iteration {iteration}")
+        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
+
+        data = data_generation_fn(
+            iteration=iteration,
+            agent=agent,
+            env=env,
+            rng_key=rng_key_1,
+            selfplay_batch_size=selfplay_batch_size,
+            num_self_plays_per_iteration=num_self_plays_per_iteration,
+            num_simulations_per_move=num_simulations_per_move,
+            game_class=game_class,
+            agent_class=agent_class,
+            aux_dir=aux_dir,
+            frozen_agent_cache=frozen_agent_cache,
+            other_agent_cache=other_agent_cache,
+            **kwargs
+        )
+
+        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
+        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
+
+        agent = agent.eval()
+        old_agent = old_agent.eval()
+
+        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
+        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
+        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
+
+        save_training_state(agent, optim, iteration, ckpt_filename)
+
+        # If we want to save models each iteration for vs_all scenario
+        if data_generation_fn == generate_self_play_data_vs_all:
+            save_model(agent, aux_dir, iteration)
+
+    print("Done!")
+
+
+#############################################
+# SPECIFIC TRAIN FUNCTIONS
+#############################################
+
 def train_normal(
     game_class="games.connect_four_game.Connect4Game",
     agent_class="policies.resnet_policy.ResnetPolicyValueNet",
@@ -321,42 +502,30 @@ def train_normal(
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 0.01,
-    ckpt_filename: str = "./agent.ckpt",
+    ckpt_filename: str = "./all_models/normal/agent.ckpt",
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
     num_eval_games: int = 128,
 ):
-    """Normal training loop using self-play data generated by the current agent."""
-    env = import_class(game_class)()
-    devices = jax.local_devices()
-    rng_key = jax.random.PRNGKey(random_seed)
-
-    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
-    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
-
-    for iteration in range(start_iter, num_iterations):
-        print(f"Iteration {iteration}")
-        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
-        agent = agent.eval()
-        data = collect_self_play_data(
-            agent,
-            env,
-            rng_key_1,
-            selfplay_batch_size,
-            num_self_plays_per_iteration,
-            num_simulations_per_move,
-        )
-
-        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
-        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
-        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
-
-        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
-        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
-
-        save_training_state(agent, optim, iteration, ckpt_filename)
-    print("Done!")
+    output_dir = os.path.dirname(ckpt_filename)
+    return train_agent_generic(
+        game_class,
+        agent_class,
+        selfplay_batch_size,
+        training_batch_size,
+        num_iterations,
+        num_simulations_per_move,
+        num_self_plays_per_iteration,
+        learning_rate,
+        ckpt_filename,
+        random_seed,
+        weight_decay,
+        lr_decay_steps,
+        num_eval_games,
+        data_generation_fn=generate_self_play_data_normal,
+        output_dir=output_dir,
+    )
 
 
 def train_frozen(
@@ -369,68 +538,34 @@ def train_frozen(
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 0.01,
-    ckpt_filename: str = "./agent_frozen.ckpt",
+    ckpt_filename: str = "./all_models/frozen/agent.ckpt",
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
     num_eval_games: int = 128,
-    base_path: str = "./models",
 ):
-    """
-    Frozen Self-Play:
-    - Generate data with the current agent until `freeze_iteration`.
-    - At `freeze_iteration`, save and freeze that agent.
-    - Beyond `freeze_iteration`, generate data using the frozen agent, but still train the main agent.
-    """
-    env = import_class(game_class)()
-    devices = jax.local_devices()
-    rng_key = jax.random.PRNGKey(random_seed)
-
-    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
-    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
-
-    model_dir = os.path.join(base_path, "frozen_self_play")
-    os.makedirs(model_dir, exist_ok=True)
-    frozen_agent = None
-
-    for iteration in range(start_iter, num_iterations):
-        print(f"Iteration {iteration}")
-
-        # Freeze agent if we hit the freeze iteration
-        if iteration == freeze_iteration:
-            print(f"Freezing agent at iteration {freeze_iteration}")
-            save_model(agent, model_dir, freeze_iteration)
-            frozen_agent = load_model(game_class, agent_class, model_dir, freeze_iteration)
-            frozen_agent = frozen_agent.eval()
-
-        opponent_agent = frozen_agent if frozen_agent else agent.eval()
-
-        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
-        data = collect_self_play_data(
-            opponent_agent,
-            env,
-            rng_key_1,
-            selfplay_batch_size,
-            num_self_plays_per_iteration,
-            num_simulations_per_move,
-        )
-
-        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
-        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
-
-        agent = agent.eval()
-        old_agent = old_agent.eval()
-
-        wins, draws, losses = evaluate_agents_after_training(
-            agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move
-        )
-
-        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
-        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
-
-        # save agent's weights to disk
-        save_training_state(agent, optim, iteration, ckpt_filename)
-    print("Done!")
+    output_dir = os.path.dirname(ckpt_filename)
+    aux_dir = os.path.join(output_dir, "frozen_self_play")
+    os.makedirs(aux_dir, exist_ok=True)
+    return train_agent_generic(
+        game_class,
+        agent_class,
+        selfplay_batch_size,
+        training_batch_size,
+        num_iterations,
+        num_simulations_per_move,
+        num_self_plays_per_iteration,
+        learning_rate,
+        ckpt_filename,
+        random_seed,
+        weight_decay,
+        lr_decay_steps,
+        num_eval_games,
+        data_generation_fn=generate_self_play_data_frozen,
+        output_dir=output_dir,
+        aux_dir=aux_dir,
+        freeze_iteration=freeze_iteration,
+    )
 
 
 def train_vs_all(
@@ -442,95 +577,33 @@ def train_vs_all(
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 0.01,
-    ckpt_filename: str = "./models/train_vs_all/agent.ckpt",
+    ckpt_filename: str = "./all_models/vs_all/agent.ckpt",
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
     num_eval_games: int = 128,
-    base_path: str = "./models",
 ):
-    """
-    Train vs all previous models:
-    - On iteration i, 1/ith of the self-play data generated by each of the previous agents.
-    - Combine all data and train the current agent.
-    """
-    env = import_class(game_class)()
-    devices = jax.local_devices()
-    rng_key = jax.random.PRNGKey(random_seed)
-
-    model_dir = os.path.join(base_path, "self_play_all")
-    os.makedirs(model_dir, exist_ok=True)
-
-    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
-    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
-
-    for iteration in range(start_iter, num_iterations):
-        print(f"Iteration {iteration}")
-
-        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
-        
-        if iteration == 0:
-            # Just generate data from the current agent
-            data = collect_self_play_data(
-                agent.eval(),
-                env,
-                rng_key_1,
-                selfplay_batch_size,
-                num_self_plays_per_iteration,
-                num_simulations_per_move,
-            )
-        else:
-            # Generate equal fraction of data from each previous agent
-            data = []
-            agents_count = iteration  # number of previously saved agents is `iteration`
-            data_per_agent = num_self_plays_per_iteration // (agents_count + 1)
-            batch_size_per_agent = selfplay_batch_size // (agents_count + 1)
-
-            # Load previous agents and generate data
-            rng_keys_for_agents = jax.random.split(rng_key_1, agents_count)
-            for prev_iter in range(iteration):
-                prev_agent = load_model(game_class, agent_class, model_dir, prev_iter)
-                prev_agent = prev_agent.eval()
-                data_prev = collect_self_play_data(
-                    prev_agent,
-                    env,
-                    rng_keys_for_agents[prev_iter],
-                    batch_size_per_agent,
-                    data_per_agent,
-                    num_simulations_per_move,
-                )
-                data.extend(data_prev)
-
-            # Also generate data from the current agent
-            rng_key_data, rng_key = jax.random.split(rng_key)
-            data_current = collect_self_play_data(
-                agent.eval(),
-                env,
-                rng_key_data,
-                batch_size_per_agent,
-                data_per_agent,
-                num_simulations_per_move,
-            )
-            data.extend(data_current)
-
-        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
-        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
-
-        # Set both agents to eval mode for evaluation
-        agent = agent.eval()
-        old_agent = old_agent.eval()
-
-        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
-
-        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
-        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
-
-        # Save current agent for future usage
-        save_training_state(agent, optim, iteration, ckpt_filename)
-        # Also save a copy of it for later loading
-        save_model(agent, model_dir, iteration)
-
-    print("Done!")
+    output_dir = os.path.dirname(ckpt_filename)
+    aux_dir = os.path.join(output_dir, "all_previous_agents")
+    os.makedirs(aux_dir, exist_ok=True)
+    return train_agent_generic(
+        game_class,
+        agent_class,
+        selfplay_batch_size,
+        training_batch_size,
+        num_iterations,
+        num_simulations_per_move,
+        num_self_plays_per_iteration,
+        learning_rate,
+        ckpt_filename,
+        random_seed,
+        weight_decay,
+        lr_decay_steps,
+        num_eval_games,
+        data_generation_fn=generate_self_play_data_vs_all,
+        output_dir=output_dir,
+        aux_dir=aux_dir,
+    )
 
 
 def train_play_vs_other(
@@ -542,69 +615,32 @@ def train_play_vs_other(
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
     learning_rate: float = 0.01,
-    ckpt_filename: str = "./models/play_vs_other_agent.ckpt",
-    other_ckpt_filename: str = "./models/other_agent.ckpt",
+    ckpt_filename: str = "./all_models/play_vs_other/agent.ckpt",
+    other_ckpt_filename: str = "./agent.ckpt",
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
     num_eval_games: int = 128,
 ):
-    """
-    Train vs other:
-    - Load a separate "frozen" model from `other_ckpt_filename`.
-    - Generate all self-play data each iteration from this frozen model.
-    - Train the current agent (live agent) on this data.
-    """
-
-    env = import_class(game_class)()
-    devices = jax.local_devices()
-    rng_key = jax.random.PRNGKey(random_seed)
-
-    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
-    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
-
-    # Load the other (frozen) agent, will never be trained or changed
-    other_agent = import_class(agent_class)(
-        input_dims=env.observation().shape,
-        num_actions=env.num_actions()
+    output_dir = os.path.dirname(ckpt_filename)
+    return train_agent_generic(
+        game_class,
+        agent_class,
+        selfplay_batch_size,
+        training_batch_size,
+        num_iterations,
+        num_simulations_per_move,
+        num_self_plays_per_iteration,
+        learning_rate,
+        ckpt_filename,
+        random_seed,
+        weight_decay,
+        lr_decay_steps,
+        num_eval_games,
+        data_generation_fn=generate_self_play_data_vs_other,
+        output_dir=output_dir,
+        other_agent_ckpt=other_ckpt_filename,
     )
-    if not os.path.isfile(other_ckpt_filename):
-        raise FileNotFoundError(f"Other checkpoint not found: {other_ckpt_filename}")
-    with open(other_ckpt_filename, "rb") as f:
-        dic = pickle.load(f)
-        other_agent = other_agent.load_state_dict(dic["agent"])
-    other_agent = other_agent.eval()
-
-    for iteration in range(start_iter, num_iterations):
-        print(f"Iteration {iteration}")
-        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
-
-        # Generate all self-play data using the other (frozen) agent
-        data = collect_self_play_data(
-            other_agent,
-            env,
-            rng_key_1,
-            selfplay_batch_size,
-            num_self_plays_per_iteration,
-            num_simulations_per_move,
-        )
-
-        # Train live agent on this data
-        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
-        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
-
-        # Evaluate: Live agent vs old agent
-        agent = agent.eval()
-        old_agent = old_agent.eval()
-
-        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
-        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
-        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
-
-        # Save the live agent
-        save_training_state(agent, optim, iteration, ckpt_filename)
-
-    print("Done!")
 
 
 if __name__ == "__main__":
