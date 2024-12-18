@@ -533,5 +533,79 @@ def train_vs_all(
     print("Done!")
 
 
+def train_play_vs_other(
+    game_class="games.connect_four_game.Connect4Game",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
+    selfplay_batch_size: int = 128,
+    training_batch_size: int = 128,
+    num_iterations: int = 10,
+    num_simulations_per_move: int = 32,
+    num_self_plays_per_iteration: int = 128 * 100,
+    learning_rate: float = 0.01,
+    ckpt_filename: str = "./models/play_vs_other_agent.ckpt",
+    other_ckpt_filename: str = "./models/other_agent.ckpt",
+    random_seed: int = 42,
+    weight_decay: float = 1e-4,
+    lr_decay_steps: int = 100_000,
+    num_eval_games: int = 128,
+):
+    """
+    Train vs other:
+    - Load a separate "frozen" model from `other_ckpt_filename`.
+    - Generate all self-play data each iteration from this frozen model.
+    - Train the current agent (live agent) on this data.
+    """
+
+    env = import_class(game_class)()
+    devices = jax.local_devices()
+    rng_key = jax.random.PRNGKey(random_seed)
+
+    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
+    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
+
+    # Load the other (frozen) agent, will never be trained or changed
+    other_agent = import_class(agent_class)(
+        input_dims=env.observation().shape,
+        num_actions=env.num_actions()
+    )
+    if not os.path.isfile(other_ckpt_filename):
+        raise FileNotFoundError(f"Other checkpoint not found: {other_ckpt_filename}")
+    with open(other_ckpt_filename, "rb") as f:
+        dic = pickle.load(f)
+        other_agent = other_agent.load_state_dict(dic["agent"])
+    other_agent = other_agent.eval()
+
+    for iteration in range(start_iter, num_iterations):
+        print(f"Iteration {iteration}")
+        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
+
+        # Generate all self-play data using the other (frozen) agent
+        data = collect_self_play_data(
+            other_agent,
+            env,
+            rng_key_1,
+            selfplay_batch_size,
+            num_self_plays_per_iteration,
+            num_simulations_per_move,
+        )
+
+        # Train live agent on this data
+        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
+        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
+
+        # Evaluate: Live agent vs old agent
+        agent = agent.eval()
+        old_agent = old_agent.eval()
+
+        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
+        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
+        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
+
+        # Save the live agent
+        save_training_state(agent, optim, iteration, ckpt_filename)
+
+    print("Done!")
+
+
 if __name__ == "__main__":
     fire.Fire()
