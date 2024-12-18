@@ -65,21 +65,29 @@ def select_tree(pred: jnp.ndarray, a, b):
 
 
 def save_model(agent, save_path: str, iteration: int):
-    """Save the model to disk."""
+    """Save only the agent's state dict."""
     os.makedirs(save_path, exist_ok=True)
     model_file = os.path.join(save_path, f"model_iteration_{iteration}.pkl")
     with open(model_file, "wb") as f:
-        pickle.dump(agent, f)
+        state_dict = jax.device_get(agent.state_dict())
+        pickle.dump(state_dict, f)
     print(f"Model saved at {model_file}")
 
 
-def load_model(load_path: str, iteration: int):
-    """Load a model from disk."""
+def load_model(game_class: str, agent_class: str, load_path: str, iteration: int):
+    """Load a model from disk by loading state dict into a freshly instantiated agent."""
     model_file = os.path.join(load_path, f"model_iteration_{iteration}.pkl")
     with open(model_file, "rb") as f:
-        model = pickle.load(f)
+        state_dict = pickle.load(f)
+    
+    env = import_class(game_class)()
+    agent = import_class(agent_class)(
+        input_dims=env.observation().shape,
+        num_actions=env.num_actions()
+    )
+    agent = agent.load_state_dict(state_dict)
     print(f"Model loaded from {model_file}")
-    return model
+    return agent
 
 
 def make_directories(base_path, variant):

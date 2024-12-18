@@ -1,21 +1,21 @@
 """
 AlphaZero training script.
 
-Train agent by self-play only.
+Contains utilities and subfunctions for training, as well as the
+train_normal and train_frozen functions.
 """
 
 import os
 import pickle
 import random
 from functools import partial
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import chex
 import click
 import fire
 import jax
 import jax.numpy as jnp
-import jax.tools.colab_tpu
 import numpy as np
 import opax
 import optax
@@ -24,7 +24,7 @@ import pax
 from games.env import Enviroment
 from play import PlayResults, agent_vs_agent_multiple_games
 from tree_search import improve_policy_with_mcts, recurrent_fn
-from utils import batched_policy, env_step, import_class, replicate, reset_env
+from utils import batched_policy, env_step, import_class, replicate, reset_env, save_model, load_model
 
 EPSILON = 1e-9  # a very small positive value
 
@@ -48,8 +48,8 @@ class MoveOutput:
     """The output of a single self-play move.
 
     state: the current state of game.
-    reward: the reward after execute the action from MCTS policy.
-    terminated: the current state is a terminated state (bad state).
+    reward: the reward after executing the action.
+    terminated: whether the current state is terminated.
     action_weights: the action probabilities from MCTS policy.
     """
 
@@ -69,13 +69,8 @@ def collect_batched_self_play_data(
 ):
     """Collect a batch of self-play data using mcts."""
 
-    def single_move(prev, inputs):
-        """Execute one self-play move using MCTS.
-
-        This function is designed to be compatible with jax.scan.
-        """
+    def single_move(prev, _):
         env, rng_key, step = prev
-        del inputs
         rng_key, rng_key_next = jax.random.split(rng_key, 2)
         state = jax.vmap(lambda e: e.canonical_observation())(env)
         terminated = env.is_terminated()
@@ -107,12 +102,8 @@ def collect_batched_self_play_data(
     return self_play_data
 
 
-def prepare_training_data(data: MoveOutput, env: Enviroment):
-    """Preprocess the data collected from self-play.
-
-    1. remove states after the enviroment is terminated.
-    2. compute the value at each state.
-    """
+def prepare_training_data(data: MoveOutput, env: Enviroment) -> List[TrainingExample]:
+    """Preprocess the data collected from self-play."""
     buffer = []
     num_games = len(data.terminated)
     for i in range(num_games):
@@ -133,24 +124,23 @@ def prepare_training_data(data: MoveOutput, env: Enviroment):
             a = np.copy(action_weights[idx])
             for augmented_s, augmented_a in env.symmetries(s, a):
                 buffer.append(
-                    TrainingExample(  # type: ignore
+                    TrainingExample(
                         state=augmented_s,
                         action_weights=augmented_a,
                         value=np.array(value, dtype=np.float32),
                     )
                 )
-
     return buffer
 
 
 def collect_self_play_data(
     agent,
-    env,
+    env: Enviroment,
     rng_key: chex.Array,
     batch_size: int,
     data_size: int,
     num_simulations_per_move: int,
-):
+) -> List[TrainingExample]:
     """Collect self-play data for training."""
     num_iters = data_size // batch_size
     devices = jax.local_devices()
@@ -184,44 +174,32 @@ def loss_fn(net, data: TrainingExample):
     mse_loss = optax.l2_loss(value, data.value)
     mse_loss = jnp.mean(mse_loss)
 
-    # policy loss (KL(target_policy', agent_policy))
+    # policy loss (KL)
     target_pr = data.action_weights
-    # to avoid log(0) = nan
     target_pr = jnp.where(target_pr == 0, EPSILON, target_pr)
     action_logits = jax.nn.log_softmax(action_logits, axis=-1)
     kl_loss = jnp.sum(target_pr * (jnp.log(target_pr) - action_logits), axis=-1)
     kl_loss = jnp.mean(kl_loss)
 
-    # return the total loss
     return mse_loss + kl_loss, (net, (mse_loss, kl_loss))
 
 
 @partial(jax.pmap, axis_name="i")
 def train_step(net, optim, data: TrainingExample):
-    """A training step."""
     (_, (net, losses)), grads = jax.value_and_grad(loss_fn, has_aux=True)(net, data)
     grads = jax.lax.pmean(grads, axis_name="i")
     net, optim = opax.apply_gradients(net, optim, grads)
     return net, optim, losses
 
 
-def train(
-    game_class="games.connect_four_game.Connect4Game",
-    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
-    selfplay_batch_size: int = 128,
-    training_batch_size: int = 128,
-    num_iterations: int = 10,
-    # num_iterations: int = 100,
-    num_simulations_per_move: int = 32,
-    num_self_plays_per_iteration: int = 128 * 100,
-    learning_rate: float = 0.01,
-    ckpt_filename: str = "./agent.ckpt",
-    random_seed: int = 42,
-    weight_decay: float = 1e-4,
-    lr_decay_steps: int = 100_000,
-    num_eval_games: int = 128,
-):
-    """Train an agent by self-play."""
+def initialize_agent_and_optim(
+    game_class: str,
+    agent_class: str,
+    weight_decay: float,
+    learning_rate: float,
+    lr_decay_steps: int,
+) -> Tuple[pax.Module, opax.optimizer]:
+    """Initialize the agent and optimizer."""
     env = import_class(game_class)()
     agent = import_class(agent_class)(
         input_dims=env.observation().shape,
@@ -237,6 +215,11 @@ def train(
         opax.sgd(lr_schedule, momentum=0.9),
     ).init(agent.parameters())
 
+    return agent, optim
+
+
+def load_checkpoint_if_exists(agent, optim, ckpt_filename: str):
+    """Load the agent and optimizer states from a checkpoint if it exists."""
     if os.path.isfile(ckpt_filename):
         print("Loading weights at", ckpt_filename)
         with open(ckpt_filename, "rb") as f:
@@ -246,15 +229,111 @@ def train(
             start_iter = dic["iter"] + 1
     else:
         start_iter = 0
-    rng_key = jax.random.PRNGKey(random_seed)
-    shuffler = random.Random(random_seed)
-    devices = jax.local_devices()
-    num_devices = jax.local_device_count()
+    return agent, optim, start_iter
+
+
+def train_one_epoch(
+    agent: pax.Module,
+    optim: opax.optimizer,
+    data: List[TrainingExample],
+    training_batch_size: int,
+    devices,
+) -> Tuple[pax.Module, opax.optimizer, float, float]:
+    """Train the agent for one epoch on the provided data."""
+    num_devices = len(devices)
+    shuffler = random.Random(42)
+
+    # Shuffle data before training
+    shuffler.shuffle(data)
 
     def _stack_and_reshape(*xs):
         x = np.stack(xs)
         x = np.reshape(x, (num_devices, -1) + x.shape[1:])
         return x
+
+    agent, optim = jax.device_put_replicated((agent.train(), optim), devices)
+    ids = range(0, len(data) - training_batch_size, training_batch_size)
+    losses = []
+    with click.progressbar(ids, label="  train agent   ") as progressbar:
+        for idx in progressbar:
+            batch = data[idx : (idx + training_batch_size)]
+            batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
+            agent, optim, loss = train_step(agent, optim, batch)
+            losses.append(loss)
+
+    value_loss, policy_loss = zip(*losses)
+    value_loss = np.mean(sum(jax.device_get(value_loss))) / len(value_loss)
+    policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
+    agent, optim = jax.tree_util.tree_map(lambda x: x[0], (agent, optim))
+    return agent, optim, value_loss, policy_loss
+
+
+def evaluate_agents_after_training(
+    agent: pax.Module,
+    old_agent: pax.Module,
+    env: Enviroment,
+    rng_key_1: chex.Array,
+    rng_key_2: chex.Array,
+    num_eval_games: int,
+    num_simulations_per_move: int,
+):
+    """Evaluate the new agent against the old agent."""
+    result_1: PlayResults = agent_vs_agent_multiple_games(
+        agent.eval(),
+        old_agent,
+        env,
+        rng_key_1,
+        num_simulations_per_move=num_simulations_per_move,
+        num_games=num_eval_games,
+    )
+    result_2: PlayResults = agent_vs_agent_multiple_games(
+        old_agent,
+        agent.eval(),
+        env,
+        rng_key_2,
+        num_simulations_per_move=num_simulations_per_move,
+        num_games=num_eval_games,
+    )
+    wins = result_1.win_count + result_2.loss_count
+    draws = result_1.draw_count + result_2.draw_count
+    losses = result_1.loss_count + result_2.win_count
+    return wins, draws, losses
+
+
+def save_training_state(agent, optim, iteration: int, filename: str):
+    """Save the current training state to disk."""
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "wb") as writer:
+        dic = {
+            "agent": jax.device_get(agent.state_dict()),
+            "optim": jax.device_get(optim.state_dict()),
+            "iter": iteration,
+        }
+        pickle.dump(dic, writer)
+
+
+def train_normal(
+    game_class="games.connect_four_game.Connect4Game",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
+    selfplay_batch_size: int = 128,
+    training_batch_size: int = 128,
+    num_iterations: int = 10,
+    num_simulations_per_move: int = 32,
+    num_self_plays_per_iteration: int = 128 * 100,
+    learning_rate: float = 0.01,
+    ckpt_filename: str = "./agent.ckpt",
+    random_seed: int = 42,
+    weight_decay: float = 1e-4,
+    lr_decay_steps: int = 100_000,
+    num_eval_games: int = 128,
+):
+    """Normal training loop using self-play data generated by the current agent."""
+    env = import_class(game_class)()
+    devices = jax.local_devices()
+    rng_key = jax.random.PRNGKey(random_seed)
+
+    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
+    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
@@ -268,67 +347,91 @@ def train(
             num_self_plays_per_iteration,
             num_simulations_per_move,
         )
-        data = list(data)
-        shuffler.shuffle(data)
-        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
-        agent, losses = agent.train(), []
-        agent, optim = jax.device_put_replicated((agent, optim), devices)
-        ids = range(0, len(data) - training_batch_size, training_batch_size)
-        with click.progressbar(ids, label="  train agent   ") as progressbar:
-            for idx in progressbar:
-                batch = data[idx : (idx + training_batch_size)]
-                batch = jax.tree_util.tree_map(_stack_and_reshape, *batch)
-                agent, optim, loss = train_step(agent, optim, batch)
-                losses.append(loss)
 
-        value_loss, policy_loss = zip(*losses)
-        value_loss = np.mean(sum(jax.device_get(value_loss))) / len(value_loss)
-        policy_loss = np.mean(sum(jax.device_get(policy_loss))) / len(policy_loss)
-        agent, optim = jax.tree_util.tree_map(lambda x: x[0], (agent, optim))
-        # new agent is player 1
-        result_1: PlayResults = agent_vs_agent_multiple_games(
-            agent.eval(),
-            old_agent,
+        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
+        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
+        wins, draws, losses = evaluate_agents_after_training(agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move)
+
+        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
+        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
+
+        save_training_state(agent, optim, iteration, ckpt_filename)
+    print("Done!")
+
+
+def train_frozen(
+    game_class="games.connect_four_game.Connect4Game",
+    agent_class="policies.resnet_policy.ResnetPolicyValueNet",
+    selfplay_batch_size: int = 128,
+    training_batch_size: int = 128,
+    num_iterations: int = 10,
+    freeze_iteration: int = 5,
+    num_simulations_per_move: int = 32,
+    num_self_plays_per_iteration: int = 128 * 100,
+    learning_rate: float = 0.01,
+    ckpt_filename: str = "./agent_frozen.ckpt",
+    random_seed: int = 42,
+    weight_decay: float = 1e-4,
+    lr_decay_steps: int = 100_000,
+    num_eval_games: int = 128,
+    base_path: str = "./models",
+):
+    """
+    Frozen Self-Play:
+    - Generate data with the current agent until `freeze_iteration`.
+    - At `freeze_iteration`, save and freeze that agent.
+    - Beyond `freeze_iteration`, generate data using the frozen agent, but still train the main agent.
+    """
+    env = import_class(game_class)()
+    devices = jax.local_devices()
+    rng_key = jax.random.PRNGKey(random_seed)
+
+    agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
+    agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
+
+    model_dir = os.path.join(base_path, "frozen_self_play")
+    os.makedirs(model_dir, exist_ok=True)
+    frozen_agent = None
+
+    for iteration in range(start_iter, num_iterations):
+        print(f"Iteration {iteration}")
+
+        # Freeze agent if we hit the freeze iteration
+        if iteration == freeze_iteration:
+            print(f"Freezing agent at iteration {freeze_iteration}")
+            save_model(agent, model_dir, freeze_iteration)
+            frozen_agent = load_model(game_class, agent_class, model_dir, freeze_iteration)
+            frozen_agent = frozen_agent.eval()
+
+        opponent_agent = frozen_agent if frozen_agent else agent.eval()
+
+        rng_key_1, rng_key_2, rng_key_3, rng_key = jax.random.split(rng_key, 4)
+        data = collect_self_play_data(
+            opponent_agent,
             env,
-            rng_key_2,
-            num_simulations_per_move=32,
-            num_games=num_eval_games,
+            rng_key_1,
+            selfplay_batch_size,
+            num_self_plays_per_iteration,
+            num_simulations_per_move,
         )
-        # old agent is player 1
-        result_2: PlayResults = agent_vs_agent_multiple_games(
-            old_agent,
-            agent.eval(),
-            env,
-            rng_key_3,
-            num_simulations_per_move=32,
-            num_games=num_eval_games,
+
+        old_agent = jax.tree_util.tree_map(jnp.copy, agent)
+        agent, optim, value_loss, policy_loss = train_one_epoch(agent, optim, data, training_batch_size, devices)
+
+        agent = agent.eval()
+        old_agent = old_agent.eval()
+
+        wins, draws, losses = evaluate_agents_after_training(
+            agent, old_agent, env, rng_key_2, rng_key_3, num_eval_games, num_simulations_per_move
         )
-        print(
-            "  evaluation      {} win - {} draw - {} loss".format(
-                result_1.win_count + result_2.loss_count,
-                result_1.draw_count + result_2.draw_count,
-                result_1.loss_count + result_2.win_count,
-            )
-        )
-        print(
-            f"  value loss {value_loss:.3f}"
-            f"  policy loss {policy_loss:.3f}"
-            f"  learning rate {optim[1][-1].learning_rate:.1e}"
-        )
+
+        print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
+        print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
+
         # save agent's weights to disk
-        with open(ckpt_filename, "wb") as writer:
-            dic = {
-                "agent": jax.device_get(agent.state_dict()),
-                "optim": jax.device_get(optim.state_dict()),
-                "iter": iteration,
-            }
-            pickle.dump(dic, writer)
+        save_training_state(agent, optim, iteration, ckpt_filename)
     print("Done!")
 
 
 if __name__ == "__main__":
-    if "COLAB_TPU_ADDR" in os.environ:
-        jax.tools.colab_tpu.setup_tpu()
-    print("Cores:", jax.local_devices())
-
-    fire.Fire(train)
+    fire.Fire()
