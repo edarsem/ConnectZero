@@ -219,6 +219,7 @@ def train(
     random_seed: int = 42,
     weight_decay: float = 1e-4,
     lr_decay_steps: int = 100_000,
+    num_eval_games: int = 128,
 ):
     """Train an agent by self-play."""
     env = import_class(game_class)()
@@ -291,6 +292,7 @@ def train(
             env,
             rng_key_2,
             num_simulations_per_move=32,
+            num_games=num_eval_games,
         )
         # old agent is player 1
         result_2: PlayResults = agent_vs_agent_multiple_games(
@@ -299,6 +301,7 @@ def train(
             env,
             rng_key_3,
             num_simulations_per_move=32,
+            num_games=num_eval_games,
         )
         print(
             "  evaluation      {} win - {} draw - {} loss".format(

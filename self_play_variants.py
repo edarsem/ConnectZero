@@ -47,9 +47,12 @@ def frozen_self_play(
             print(f"Freezing agent at iteration {freeze_iteration}")
             save_model(agent, model_dir, freeze_iteration)
             frozen_agent = load_model(model_dir, freeze_iteration)
+            frozen_agent = frozen_agent.eval()
 
         # Generate data with frozen agent
         opponent_agent = frozen_agent if frozen_agent else agent
+        opponent_agent = opponent_agent.eval()
+
         rng_key = jax.random.PRNGKey(iteration)
         data = collect_self_play_data(
             opponent_agent,
@@ -163,6 +166,7 @@ if __name__ == "__main__":
         "num_self_plays_per_iteration": 1280,
         "num_simulations_per_move": 32,
         "num_iterations": 10,
+        "num_eval_games": 128,
     }
 
     print("Starting Normal Self-Play...")
@@ -176,8 +180,8 @@ if __name__ == "__main__":
     print("Starting Self-Play with All Previous Models...")
     self_play_with_all(GAME_CLASS, AGENT_CLASS, BASE_PATH, total_iterations=10, **TRAIN_KWARGS)
 
-    print("Starting Self-Play with Fixed Agents...")
-    FIXED_AGENTS_DIR = "./models/fixed_agents"
-    self_play_with_fixed_agents(
-        GAME_CLASS, AGENT_CLASS, BASE_PATH, FIXED_AGENTS_DIR, agent_type="weak_agent", **TRAIN_KWARGS
-    )
+    # print("Starting Self-Play with Fixed Agents...")
+    # FIXED_AGENTS_DIR = "./models/fixed_agents"
+    # self_play_with_fixed_agents(
+    #     GAME_CLASS, AGENT_CLASS, BASE_PATH, FIXED_AGENTS_DIR, agent_type="weak_agent", **TRAIN_KWARGS
+    # )
