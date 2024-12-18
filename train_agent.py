@@ -441,6 +441,11 @@ def train_agent_generic(
     aux_dir: str = "",
     **kwargs
 ):
+    # Ensure output directories exist
+    os.makedirs(output_dir, exist_ok=True)
+    if aux_dir:
+        os.makedirs(aux_dir, exist_ok=True)
+
     env = import_class(game_class)()
     devices = jax.local_devices()
     rng_key = jax.random.PRNGKey(random_seed)
