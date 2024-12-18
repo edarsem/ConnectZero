@@ -156,7 +156,7 @@ def collect_self_play_data(
     devices = jax.local_devices()
     num_devices = len(devices)
     rng_key_list = jax.random.split(rng_key, num_iters * num_devices)
-    rng_keys = jnp.stack(rng_key_list).reshape((num_iters, num_devices, -1))  # type: ignore
+    rng_keys = jnp.stack(rng_key_list).reshape((num_iters, num_devices, -1))
     data = []
 
     with click.progressbar(range(num_iters), label="  self play     ") as bar:
@@ -210,7 +210,7 @@ def train(
     agent_class="policies.resnet_policy.ResnetPolicyValueNet",
     selfplay_batch_size: int = 128,
     training_batch_size: int = 128,
-    num_iterations: int = 3,
+    num_iterations: int = 10,
     # num_iterations: int = 100,
     num_simulations_per_move: int = 32,
     num_self_plays_per_iteration: int = 128 * 100,
@@ -263,7 +263,7 @@ def train(
         data = collect_self_play_data(
             agent,
             env,
-            rng_key_1,  # type: ignore
+            rng_key_1,
             selfplay_batch_size,
             num_self_plays_per_iteration,
             num_simulations_per_move,
