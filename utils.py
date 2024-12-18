@@ -3,6 +3,8 @@
 import importlib
 from functools import partial
 from typing import Tuple, TypeVar
+import pickle
+import os
 
 import chex
 import jax
@@ -60,3 +62,21 @@ def select_tree(pred: jnp.ndarray, a, b):
     """Selects a pytree based on the given predicate."""
     assert pred.ndim == 0 and pred.dtype == jnp.bool_, "expected boolean scalar"
     return jax.tree_util.tree_map(partial(jax.lax.select, pred), a, b)
+
+
+def save_model(agent, save_path: str, iteration: int):
+    """Save the model to disk."""
+    os.makedirs(save_path, exist_ok=True)
+    model_file = os.path.join(save_path, f"model_iteration_{iteration}.pkl")
+    with open(model_file, "wb") as f:
+        pickle.dump(agent, f)
+    print(f"Model saved at {model_file}")
+
+
+def load_model(load_path: str, iteration: int):
+    """Load a model from disk."""
+    model_file = os.path.join(load_path, f"model_iteration_{iteration}.pkl")
+    with open(model_file, "rb") as f:
+        model = pickle.load(f)
+    print(f"Model loaded from {model_file}")
+    return model
