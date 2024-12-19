@@ -52,21 +52,31 @@ def run_tournament(
     num_simulations_per_move: int = 32,
     disable_mcts: bool = False,
 ):
+    """
+    Run a double round-robin tournament among the given agents.
+    Scoring:
+    - win = 1 point
+    - draw = 0.5 points
+    - loss = 0 points
+    """
     env_class = import_class(game_class)
     env = env_class()
 
-    # Sort agents by iteration to have a consistent order
-    agents_sorted = sorted(agents, key=lambda x: x[0])
+    # Sort agents by (method + iteration) to have a consistent order
+    agents_sorted = sorted(agents, key=lambda x: (x[2], x[0]))
     num_agents = len(agents_sorted)
-    scores = {agents_sorted[i][0]: 0.0 for i in range(num_agents)}
+    scores = {f"{a[2]}_iter_{a[0]}": 0.0 for a in agents_sorted}
 
     matchup_matrix = [["-" for _ in range(num_agents)] for _ in range(num_agents)]
     rng = jax.random.PRNGKey(0)
 
     for i in range(num_agents):
         for j in range(i + 1, num_agents):
-            iter_i, agent_i, _ = agents_sorted[i]
-            iter_j, agent_j, _ = agents_sorted[j]
+            iter_i, agent_i, method_i = agents_sorted[i]
+            iter_j, agent_j, method_j = agents_sorted[j]
+
+            label_i = f"{method_i}_iter_{iter_i}"
+            label_j = f"{method_j}_iter_{iter_j}"
 
             rng, rng1 = jax.random.split(rng)
             result_1: PlayResults = agent_vs_agent_multiple_games(
@@ -90,8 +100,8 @@ def run_tournament(
             score_j += (result_2.win_count * 1.0) + (result_2.draw_count * 0.5)
             score_i += (result_2.loss_count * 1.0) + (result_2.draw_count * 0.5)
 
-            scores[iter_i] += float(score_i)
-            scores[iter_j] += float(score_j)
+            scores[label_i] += float(score_i)
+            scores[label_j] += float(score_j)
 
             wins = int(result_1.win_count)
             draws = int(result_1.draw_count)
@@ -116,7 +126,7 @@ def test_mode(directories: List[str], game_class: str, agent_class: str, limit: 
 def main(
     game_class: str = "games.connect_four_game.Connect4Game",
     agent_class: str = "policies.resnet_policy.ResnetPolicyValueNet",
-    directory: str = "./all_models/normal/models_by_iteration",
+    directory: str = "./all_models/normal/models_by_iteration ./all_models/frozen/models_by_iteration ./all_models/vs_all/models_by_iteration",
     num_games: int = 2,
     num_simulations_per_move: int = 32,
     disable_mcts: bool = False,
@@ -124,7 +134,9 @@ def main(
     output_csv: str = "tournament_results.csv",
     test: bool = False,
 ):
-    # directory can be multiple space-separated paths
+    """
+    Run a tournament or test agent discovery.
+    """
     directories = directory.split()
 
     if test:
@@ -145,15 +157,16 @@ def main(
     )
 
     print("Results:")
-    for iter_num, _, _ in agents_sorted:
-        print(f"Iteration {iter_num}: {scores[iter_num]} points")
+    for iter_num, _, method in agents_sorted:
+        label = f"{method}_iter_{iter_num}"
+        print(f"{label}: {scores[label]} points")
 
-    iters = [a[0] for a in agents_sorted]
+    labels = [f"{a[2]}_iter_{a[0]}" for a in agents_sorted]
     with open(output_csv, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow([""] + iters)
-        for i, it_i in enumerate(iters):
-            row = [it_i] + matchup_matrix[i]
+        writer.writerow([""] + labels)
+        for i, label_i in enumerate(labels):
+            row = [label_i] + matchup_matrix[i]
             writer.writerow(row)
 
     print(f"Cross table saved to {output_csv}")
