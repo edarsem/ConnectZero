@@ -103,10 +103,17 @@ def run_tournament(
             scores[label_i] += float(score_i)
             scores[label_j] += float(score_j)
 
-            wins = int(result_1.win_count)
-            draws = int(result_1.draw_count)
-            losses = int(result_1.loss_count)
-            matchup_matrix[i][j] = f"{wins}:{draws}:{losses}"
+            # Store results for agent_i first vs agent_j second (upper triangle)
+            wins_ij = int(result_1.win_count)
+            draws_ij = int(result_1.draw_count)
+            losses_ij = int(result_1.loss_count)
+            matchup_matrix[i][j] = f"{wins_ij}:{draws_ij}:{losses_ij}"
+
+            # Store results for agent_j first vs agent_i second (lower triangle)
+            wins_ji = int(result_2.win_count)
+            draws_ji = int(result_2.draw_count)
+            losses_ji = int(result_2.loss_count)
+            matchup_matrix[j][i] = f"{wins_ji}:{draws_ji}:{losses_ji}"
 
     return scores, agents_sorted, matchup_matrix
 
