@@ -606,7 +606,7 @@ def train_vs_all(
     num_eval_games: int = 128,
 ):
     output_dir = os.path.dirname(ckpt_filename)
-    aux_dir = os.path.join(output_dir, "all_previous_agents")
+    aux_dir = os.path.join(output_dir, "models_by_iteration")
     os.makedirs(aux_dir, exist_ok=True)
     return train_agent_generic(
         game_class,
