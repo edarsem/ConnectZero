@@ -4,6 +4,7 @@ import csv
 import random
 from functools import partial
 from typing import Optional, List, Tuple, Callable
+import math
 
 import chex
 import click
@@ -317,6 +318,85 @@ def generate_self_play_data_frozen(
         num_self_plays_per_iteration,
         num_simulations_per_move,
     )
+
+
+def precompute_future_data(
+    iteration: int,
+    agent,
+    env,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    max_iterations: int,
+    output_dir: str,
+):
+    """
+    For play vs all efficient data collection strategy:
+    Precompute and store data that will be needed for all future iterations > i.
+    For example, we might decide that for iteration i, we prepare data for iterations i+1 to max_iterations.
+    The amount of data could be determined by some formula, e.g. sum(1/k) for k=i+1 to max_iterations.
+    """
+
+    future_iterations = range(iteration + 1, max_iterations + 1)
+    scale_factor = sum(1.0 / k for k in future_iterations) if future_iterations else 0.0
+
+    # Amount of data to generate now could be scale_factor * num_self_plays_per_iteration
+    data_size = int(math.ceil(num_self_plays_per_iteration * scale_factor))
+
+    if data_size > 0:
+        rng_key_data, rng_key = jax.random.split(rng_key)
+
+        # Generate the large data buffer from the current agent (or any logic you want).
+        data = collect_self_play_data(
+            agent.eval(),
+            env,
+            rng_key_data,
+            selfplay_batch_size,
+            data_size,
+            num_simulations_per_move,
+        )
+    else:
+        data = []
+
+    # Save this data so future iterations can load fractions of it.
+    data_path = os.path.join(output_dir, f"data_iteration_{iteration}.pkl")
+    with open(data_path, "wb") as f:
+        pickle.dump(data, f)
+
+    return rng_key
+
+
+def load_data_for_iteration(
+    iteration: int,
+    output_dir: str
+) -> List[TrainingExample]:
+    """
+    Load the required fraction of data for the current iteration j.
+    For each previous iteration i < j, we take a fraction 1/j of that iteration's precomputed data.
+    After loading, we can optionally remove or mark used data to prevent re-use.
+    """
+
+    data = []
+    for i in range(iteration):
+        data_path = os.path.join(output_dir, f"data_iteration_{i}.pkl")
+        if not os.path.isfile(data_path):
+            continue
+        with open(data_path, "rb") as f:
+            all_data = pickle.load(f)
+
+        # Take 1/j fraction
+        fraction = 1.0 / iteration
+        subset_size = int(len(all_data) * fraction)
+        subset = all_data[:subset_size]
+        data.extend(subset)
+
+        # Delete used data
+        remaining_data = all_data[subset_size:]
+        with open(data_path, "wb") as f:
+            pickle.dump(remaining_data, f)
+
+    return data
 
 
 def generate_self_play_data_vs_all(
