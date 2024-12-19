@@ -1,8 +1,10 @@
 import os
 import pickle
+import csv
 import random
 from functools import partial
 from typing import Optional, List, Tuple, Callable
+import math
 
 import chex
 import click
@@ -318,6 +320,85 @@ def generate_self_play_data_frozen(
     )
 
 
+def precompute_future_data(
+    iteration: int,
+    agent,
+    env,
+    rng_key: chex.Array,
+    selfplay_batch_size: int,
+    num_self_plays_per_iteration: int,
+    num_simulations_per_move: int,
+    max_iterations: int,
+    output_dir: str,
+):
+    """
+    For play vs all efficient data collection strategy:
+    Precompute and store data that will be needed for all future iterations > i.
+    For example, we might decide that for iteration i, we prepare data for iterations i+1 to max_iterations.
+    The amount of data could be determined by some formula, e.g. sum(1/k) for k=i+1 to max_iterations.
+    """
+
+    future_iterations = range(iteration + 1, max_iterations + 1)
+    scale_factor = sum(1.0 / k for k in future_iterations) if future_iterations else 0.0
+
+    # Amount of data to generate now could be scale_factor * num_self_plays_per_iteration
+    data_size = int(math.ceil(num_self_plays_per_iteration * scale_factor))
+
+    if data_size > 0:
+        rng_key_data, rng_key = jax.random.split(rng_key)
+
+        # Generate the large data buffer from the current agent (or any logic you want).
+        data = collect_self_play_data(
+            agent.eval(),
+            env,
+            rng_key_data,
+            selfplay_batch_size,
+            data_size,
+            num_simulations_per_move,
+        )
+    else:
+        data = []
+
+    # Save this data so future iterations can load fractions of it.
+    data_path = os.path.join(output_dir, f"data_iteration_{iteration}.pkl")
+    with open(data_path, "wb") as f:
+        pickle.dump(data, f)
+
+    return rng_key
+
+
+def load_data_for_iteration(
+    iteration: int,
+    output_dir: str
+) -> List[TrainingExample]:
+    """
+    Load the required fraction of data for the current iteration j.
+    For each previous iteration i < j, we take a fraction 1/j of that iteration's precomputed data.
+    After loading, we can optionally remove or mark used data to prevent re-use.
+    """
+
+    data = []
+    for i in range(iteration):
+        data_path = os.path.join(output_dir, f"data_iteration_{i}.pkl")
+        if not os.path.isfile(data_path):
+            continue
+        with open(data_path, "rb") as f:
+            all_data = pickle.load(f)
+
+        # Take 1/j fraction
+        fraction = 1.0 / iteration
+        subset_size = int(len(all_data) * fraction)
+        subset = all_data[:subset_size]
+        data.extend(subset)
+
+        # Delete used data
+        remaining_data = all_data[subset_size:]
+        with open(data_path, "wb") as f:
+            pickle.dump(remaining_data, f)
+
+    return data
+
+
 def generate_self_play_data_vs_all(
     iteration: int,
     agent: pax.Module,
@@ -329,11 +410,12 @@ def generate_self_play_data_vs_all(
     aux_dir: str,
     game_class: str,
     agent_class: str,
+    output_dir: str,
     **kwargs
 ) -> List[TrainingExample]:
-    rng_key_1, rng_key = jax.random.split(rng_key)
 
     if iteration == 0:
+        rng_key_1, _ = jax.random.split(rng_key)
         return collect_self_play_data(
             agent.eval(),
             env,
@@ -343,38 +425,7 @@ def generate_self_play_data_vs_all(
             num_simulations_per_move,
         )
     else:
-        # Generate equal fraction of data from each previous agent plus current agent
-        data = []
-        agents_count = iteration
-        data_per_agent = num_self_plays_per_iteration // (agents_count + 1)
-        batch_size_per_agent = selfplay_batch_size // (agents_count + 1)
-
-        rng_keys_for_agents = jax.random.split(rng_key_1, agents_count)
-        for prev_iter in range(iteration):
-            prev_agent = load_model(game_class, agent_class, aux_dir, prev_iter)
-            prev_agent = prev_agent.eval()
-            data_prev = collect_self_play_data(
-                prev_agent,
-                env,
-                rng_keys_for_agents[prev_iter],
-                batch_size_per_agent,
-                data_per_agent,
-                num_simulations_per_move,
-            )
-            data.extend(data_prev)
-
-        # Current agent data
-        rng_key_data, _ = jax.random.split(rng_key)
-        data_current = collect_self_play_data(
-            agent.eval(),
-            env,
-            rng_key_data,
-            batch_size_per_agent,
-            data_per_agent,
-            num_simulations_per_move,
-        )
-        data.extend(data_current)
-        return data
+        return load_data_for_iteration(iteration, output_dir)
 
 
 def generate_self_play_data_vs_other(
@@ -440,15 +491,34 @@ def train_agent_generic(
     aux_dir: str = "",
     **kwargs
 ):
+    # Ensure output directories exist
+    os.makedirs(output_dir, exist_ok=True)
+    if aux_dir:
+        os.makedirs(aux_dir, exist_ok=True)
+
+    models_dir = os.path.join(output_dir, "models_by_iteration")
+    os.makedirs(models_dir, exist_ok=True)
+
     env = import_class(game_class)()
     devices = jax.local_devices()
     rng_key = jax.random.PRNGKey(random_seed)
     agent, optim = initialize_agent_and_optim(game_class, agent_class, weight_decay, learning_rate, lr_decay_steps)
     agent, optim, start_iter = load_checkpoint_if_exists(agent, optim, ckpt_filename)
 
+    # Prepare log file
+    log_filename = os.path.join(output_dir, "training_log.csv")
+    log_exists = os.path.isfile(log_filename)
+    with open(log_filename, "a", newline="") as log_file:
+        writer = csv.writer(log_file)
+        if not log_exists:
+            writer.writerow(["iteration", "value_loss", "policy_loss", "wins", "draws", "losses"])
+
     # Caches for loading frozen/other agents only once
     frozen_agent_cache = {}
     other_agent_cache = {}
+        
+    # Precompute data each iteration after training for vs_all
+    is_vs_all = (data_generation_fn == generate_self_play_data_vs_all)
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
@@ -464,6 +534,7 @@ def train_agent_generic(
             num_simulations_per_move=num_simulations_per_move,
             game_class=game_class,
             agent_class=agent_class,
+            output_dir=output_dir,
             aux_dir=aux_dir,
             frozen_agent_cache=frozen_agent_cache,
             other_agent_cache=other_agent_cache,
@@ -480,11 +551,30 @@ def train_agent_generic(
         print(f"  evaluation      {wins} win - {draws} draw - {losses} loss")
         print(f"  value loss {value_loss:.3f}  policy loss {policy_loss:.3f}")
 
+        # Append results to log
+        with open(log_filename, "a", newline="") as log_file:
+            writer = csv.writer(log_file)
+            writer.writerow([iteration, value_loss, policy_loss, wins, draws, losses])
+
+        # Save the current agent with its iteration
+        save_model(agent, models_dir, iteration)
+
+        # Save checkpoint
         save_training_state(agent, optim, iteration, ckpt_filename)
 
-        # If we want to save models each iteration for vs_all scenario
-        if data_generation_fn == generate_self_play_data_vs_all:
-            save_model(agent, aux_dir, iteration)
+        # If vs_all, precompute data for future iterations
+        if is_vs_all and iteration < (num_iterations - 1):
+            rng_key = precompute_future_data(
+                iteration,
+                agent,
+                env,
+                rng_key,
+                selfplay_batch_size,
+                num_self_plays_per_iteration,
+                num_simulations_per_move,
+                max_iterations=num_iterations - 1,
+                output_dir=output_dir,
+            )
 
     print("Done!")
 
@@ -584,7 +674,7 @@ def train_vs_all(
     num_eval_games: int = 128,
 ):
     output_dir = os.path.dirname(ckpt_filename)
-    aux_dir = os.path.join(output_dir, "all_previous_agents")
+    aux_dir = os.path.join(output_dir, "models_by_iteration")
     os.makedirs(aux_dir, exist_ok=True)
     return train_agent_generic(
         game_class,
