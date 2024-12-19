@@ -410,11 +410,12 @@ def generate_self_play_data_vs_all(
     aux_dir: str,
     game_class: str,
     agent_class: str,
+    output_dir: str,
     **kwargs
 ) -> List[TrainingExample]:
-    rng_key_1, rng_key = jax.random.split(rng_key)
 
     if iteration == 0:
+        rng_key_1, _ = jax.random.split(rng_key)
         return collect_self_play_data(
             agent.eval(),
             env,
@@ -424,38 +425,7 @@ def generate_self_play_data_vs_all(
             num_simulations_per_move,
         )
     else:
-        # Generate equal fraction of data from each previous agent plus current agent
-        data = []
-        agents_count = iteration
-        data_per_agent = num_self_plays_per_iteration // (agents_count + 1)
-        batch_size_per_agent = selfplay_batch_size // (agents_count + 1)
-
-        rng_keys_for_agents = jax.random.split(rng_key_1, agents_count)
-        for prev_iter in range(iteration):
-            prev_agent = load_model(game_class, agent_class, aux_dir, prev_iter)
-            prev_agent = prev_agent.eval()
-            data_prev = collect_self_play_data(
-                prev_agent,
-                env,
-                rng_keys_for_agents[prev_iter],
-                batch_size_per_agent,
-                data_per_agent,
-                num_simulations_per_move,
-            )
-            data.extend(data_prev)
-
-        # Current agent data
-        rng_key_data, _ = jax.random.split(rng_key)
-        data_current = collect_self_play_data(
-            agent.eval(),
-            env,
-            rng_key_data,
-            batch_size_per_agent,
-            data_per_agent,
-            num_simulations_per_move,
-        )
-        data.extend(data_current)
-        return data
+        return load_data_for_iteration(iteration, output_dir)
 
 
 def generate_self_play_data_vs_other(
@@ -546,6 +516,9 @@ def train_agent_generic(
     # Caches for loading frozen/other agents only once
     frozen_agent_cache = {}
     other_agent_cache = {}
+        
+    # Precompute data each iteration after training for vs_all
+    is_vs_all = (data_generation_fn == generate_self_play_data_vs_all)
 
     for iteration in range(start_iter, num_iterations):
         print(f"Iteration {iteration}")
@@ -561,6 +534,7 @@ def train_agent_generic(
             num_simulations_per_move=num_simulations_per_move,
             game_class=game_class,
             agent_class=agent_class,
+            output_dir=output_dir,
             aux_dir=aux_dir,
             frozen_agent_cache=frozen_agent_cache,
             other_agent_cache=other_agent_cache,
@@ -587,6 +561,20 @@ def train_agent_generic(
 
         # Save checkpoint
         save_training_state(agent, optim, iteration, ckpt_filename)
+
+        # If vs_all, precompute data for future iterations
+        if is_vs_all and iteration < (num_iterations - 1):
+            rng_key = precompute_future_data(
+                iteration,
+                agent,
+                env,
+                rng_key,
+                selfplay_batch_size,
+                num_self_plays_per_iteration,
+                num_simulations_per_move,
+                max_iterations=num_iterations - 1,
+                output_dir=output_dir,
+            )
 
     print("Done!")
 
